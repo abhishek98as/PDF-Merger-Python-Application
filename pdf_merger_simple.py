@@ -50,7 +50,8 @@ def get_subprocess_creation_flags():
     """Get proper subprocess creation flags for Windows PyInstaller builds."""
     if sys.platform.startswith('win') and is_frozen():
         # Hide console windows when running as exe
-        return subprocess.CREATE_NO_WINDOW
+        # CREATE_NO_WINDOW = 0x08000000
+        return getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
     return 0
 
 # Define path for resources
@@ -171,22 +172,45 @@ class SimpleThumbnailWorker(QThread):
                 self.result.emit(self.path, THUMBNAIL_CACHE[cache_key])
                 return
             
-            qpix = render_page_qpix(self.path, page_index=0, 
-                                   max_w=self.thumb_size[0], 
-                                   max_h=self.thumb_size[1])
-            if not qpix.isNull():
-                icon = QIcon(qpix)
+            # Add timeout for thumbnail generation
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Thumbnail generation timed out")
+            
+            # Set timeout only on Unix systems
+            if hasattr(signal, 'SIGALRM'):
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(10)  # 10 second timeout
+            
+            try:
+                qpix = render_page_qpix(self.path, page_index=0, 
+                                       max_w=self.thumb_size[0], 
+                                       max_h=self.thumb_size[1])
                 
-                # Cache the result
-                if len(THUMBNAIL_CACHE) >= CACHE_MAX_SIZE:
-                    # Remove oldest entry
-                    oldest_key = next(iter(THUMBNAIL_CACHE))
-                    del THUMBNAIL_CACHE[oldest_key]
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)  # Cancel timeout
+                    
+                if not qpix.isNull():
+                    icon = QIcon(qpix)
+                    
+                    # Cache the result
+                    if len(THUMBNAIL_CACHE) >= CACHE_MAX_SIZE:
+                        # Remove oldest entry
+                        oldest_key = next(iter(THUMBNAIL_CACHE))
+                        del THUMBNAIL_CACHE[oldest_key]
+                    
+                    THUMBNAIL_CACHE[cache_key] = icon
+                    self.result.emit(self.path, icon)
+                else:
+                    self.error.emit(self.path, "Failed to generate thumbnail")
+                    
+            except TimeoutError:
+                if hasattr(signal, 'SIGALRM'):
+                    signal.alarm(0)  # Cancel timeout
+                logger.warning(f"Thumbnail generation timed out for {self.path}")
+                self.error.emit(self.path, "Thumbnail generation timed out")
                 
-                THUMBNAIL_CACHE[cache_key] = icon
-                self.result.emit(self.path, icon)
-            else:
-                self.error.emit(self.path, "Failed to generate thumbnail")
         except Exception as e:
             logger.error(f"Thumbnail generation failed for {self.path}: {str(e)}")
             self.error.emit(self.path, str(e))
