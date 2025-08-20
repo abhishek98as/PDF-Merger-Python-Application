@@ -3,6 +3,7 @@ import sys
 import pathlib
 import tempfile
 import logging
+import subprocess
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -40,19 +41,45 @@ logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('PDFMerger')
 
+# PyInstaller compatibility
+def is_frozen():
+    """Check if running in a PyInstaller bundle."""
+    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+
+def get_subprocess_creation_flags():
+    """Get proper subprocess creation flags for Windows PyInstaller builds."""
+    if sys.platform.startswith('win') and is_frozen():
+        # Hide console windows when running as exe
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
 # Define path for resources
 def get_resource_path():
-    base_path = pathlib.Path(__file__).resolve().parent
+    if is_frozen():
+        # When running as PyInstaller exe, use the temporary directory
+        base_path = pathlib.Path(sys._MEIPASS)
+    else:
+        # When running as script, use script directory
+        base_path = pathlib.Path(__file__).resolve().parent
+    
     assets_dir = base_path / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
     return assets_dir
 
 # Get the Poppler path
 def get_poppler_path():
-    base_path = pathlib.Path(__file__).resolve().parent
-    local_poppler = base_path / "poppler-23.11.0" / "Library" / "bin"
-    if local_poppler.exists():
-        return str(local_poppler)
+    if is_frozen():
+        # When running as PyInstaller exe, check bundled poppler first
+        base_path = pathlib.Path(sys._MEIPASS)
+        bundled_poppler = base_path / "poppler" / "bin"
+        if bundled_poppler.exists():
+            return str(bundled_poppler)
+    else:
+        # When running as script, check local poppler
+        base_path = pathlib.Path(__file__).resolve().parent
+        local_poppler = base_path / "poppler-23.11.0" / "Library" / "bin"
+        if local_poppler.exists():
+            return str(local_poppler)
     
     # Try environment variable
     env_path = os.environ.get("POPPLER_PATH")
@@ -80,6 +107,10 @@ POPPLER_PATH = get_poppler_path()
 # Global thread pool
 MAX_WORKERS = min(16, (os.cpu_count() or 1) + 4)
 THUMBNAIL_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="thumbnail")
+
+# Simple thumbnail cache to avoid regenerating thumbnails
+THUMBNAIL_CACHE = {}
+CACHE_MAX_SIZE = 50
 
 @dataclass
 class PDFEntry:
@@ -132,11 +163,28 @@ class SimpleThumbnailWorker(QThread):
 
     def run(self) -> None:
         try:
+            # Check cache first
+            cache_key = f"{self.path}_{self.thumb_size[0]}x{self.thumb_size[1]}_{self.path.stat().st_mtime}"
+            
+            if cache_key in THUMBNAIL_CACHE:
+                logger.debug(f"Using cached thumbnail for {self.path}")
+                self.result.emit(self.path, THUMBNAIL_CACHE[cache_key])
+                return
+            
             qpix = render_page_qpix(self.path, page_index=0, 
                                    max_w=self.thumb_size[0], 
                                    max_h=self.thumb_size[1])
             if not qpix.isNull():
-                self.result.emit(self.path, QIcon(qpix))
+                icon = QIcon(qpix)
+                
+                # Cache the result
+                if len(THUMBNAIL_CACHE) >= CACHE_MAX_SIZE:
+                    # Remove oldest entry
+                    oldest_key = next(iter(THUMBNAIL_CACHE))
+                    del THUMBNAIL_CACHE[oldest_key]
+                
+                THUMBNAIL_CACHE[cache_key] = icon
+                self.result.emit(self.path, icon)
             else:
                 self.error.emit(self.path, "Failed to generate thumbnail")
         except Exception as e:
@@ -310,14 +358,33 @@ class SimpleScrollablePreview(QScrollArea):
         self.show_message("Loading PDF...")
         
         try:
-            # Load first few pages for preview
-            images = convert_from_path(
-                str(path), 
-                first_page=1, 
-                last_page=min(5, len(PdfReader(str(path)).pages)), 
-                dpi=150,
-                poppler_path=POPPLER_PATH
-            )
+            # Configure pdf2image to hide console windows on Windows
+            import pdf2image.pdf2image as pdf2image_module
+            
+            # Monkey patch the subprocess call to use proper creation flags
+            original_popen = subprocess.Popen
+            def patched_popen(*args, **kwargs):
+                if sys.platform.startswith('win') and is_frozen():
+                    kwargs.setdefault('creationflags', get_subprocess_creation_flags())
+                return original_popen(*args, **kwargs)
+            
+            # Temporarily replace Popen
+            subprocess.Popen = patched_popen
+            pdf2image_module.subprocess.Popen = patched_popen
+            
+            try:
+                # Load first few pages for preview
+                images = convert_from_path(
+                    str(path), 
+                    first_page=1, 
+                    last_page=min(5, len(PdfReader(str(path)).pages)), 
+                    dpi=150,
+                    poppler_path=POPPLER_PATH
+                )
+            finally:
+                # Restore original Popen
+                subprocess.Popen = original_popen
+                pdf2image_module.subprocess.Popen = original_popen
             
             if images:
                 for i, img in enumerate(images):
@@ -567,21 +634,52 @@ class SimpleMainWindow(QMainWindow):
         
         logger.info(f"Processing batch of {len(files_to_process)} files")
         
-        # Process each file individually to avoid complex threading
-        for path in files_to_process:
-            self._process_single_file(path)
+        # Process files one by one to avoid thread overload
+        if files_to_process:
+            # Start with the first file
+            self._current_batch = files_to_process
+            self._current_batch_index = 0
+            self._process_next_in_batch()
 
-    def _process_single_file(self, path: pathlib.Path):
-        # Start thumbnail generation
+    def _process_next_in_batch(self):
+        """Process the next file in the current batch."""
+        if not hasattr(self, '_current_batch') or self._current_batch_index >= len(self._current_batch):
+            # Batch processing complete
+            if hasattr(self, '_current_batch'):
+                logger.info(f"Completed processing batch of {len(self._current_batch)} files")
+                delattr(self, '_current_batch')
+                delattr(self, '_current_batch_index')
+            return
+        
+        path = self._current_batch[self._current_batch_index]
+        self._current_batch_index += 1
+        
+        # Clean up any existing workers first
+        if self._thumb_worker and self._thumb_worker.isRunning():
+            self._thumb_worker.quit()
+            self._thumb_worker.wait(1000)
+        
+        if self._page_worker and self._page_worker.isRunning():
+            self._page_worker.quit()
+            self._page_worker.wait(1000)
+        
+        # Start thumbnail generation with completion callback
         self._thumb_worker = SimpleThumbnailWorker(path, self.listw.iconSize())
         self._thumb_worker.result.connect(self._on_thumb_ready)
         self._thumb_worker.error.connect(self._on_thumb_error)
+        self._thumb_worker.finished.connect(self._on_thumbnail_finished)
         self._thumb_worker.start()
         
         # Start page counting
         self._page_worker = SimplePageCountWorker(path)
         self._page_worker.counted.connect(self._on_pages_ready)
         self._page_worker.start()
+
+    def _on_thumbnail_finished(self):
+        """Called when thumbnail generation is finished, continue with next file."""
+        # Small delay to prevent overwhelming the system
+        QTimer.singleShot(100, self._process_next_in_batch)
+
 
     def on_add_folder(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select a folder containing PDFs", str(pathlib.Path.home()))
@@ -710,10 +808,20 @@ class SimpleMainWindow(QMainWindow):
     def closeEvent(self, event):
         logger.info("Application closing, cleaning up resources...")
         
+        # Stop batch processing
+        if hasattr(self, '_current_batch'):
+            delattr(self, '_current_batch')
+            delattr(self, '_current_batch_index')
+        
+        self._batch_timer.stop()
+        
+        # Clean up workers
         if self._thumb_worker and self._thumb_worker.isRunning():
+            self._thumb_worker.quit()
             self._thumb_worker.wait(3000)
             
         if self._page_worker and self._page_worker.isRunning():
+            self._page_worker.quit()
             self._page_worker.wait(3000)
         
         try:
@@ -736,14 +844,37 @@ def ensure_icon():
         logger.error(f"Icon generation failed: {str(e)}", exc_info=True)
 
 def render_page_qpix(path: pathlib.Path, page_index: int = 0, max_w: Optional[int] = None, max_h: Optional[int] = None) -> QPixmap:
+    """Render a PDF page to QPixmap with PyInstaller compatibility."""
     try:
-        images = convert_from_path(
-            str(path), 
-            first_page=page_index + 1, 
-            last_page=page_index + 1, 
-            dpi=150,
-            poppler_path=POPPLER_PATH
-        )
+        # Configure pdf2image to hide console windows on Windows
+        import pdf2image.pdf2image as pdf2image_module
+        
+        # Monkey patch the subprocess call to use proper creation flags
+        original_popen = subprocess.Popen
+        def patched_popen(*args, **kwargs):
+            if sys.platform.startswith('win') and is_frozen():
+                kwargs.setdefault('creationflags', get_subprocess_creation_flags())
+            return original_popen(*args, **kwargs)
+        
+        # Temporarily replace Popen
+        subprocess.Popen = patched_popen
+        pdf2image_module.subprocess.Popen = patched_popen
+        
+        try:
+            # Use lower DPI for thumbnails to improve speed
+            dpi = 120 if max_w and max_w < 200 else 150
+            
+            images = convert_from_path(
+                str(path), 
+                first_page=page_index + 1, 
+                last_page=page_index + 1, 
+                dpi=dpi,
+                poppler_path=POPPLER_PATH
+            )
+        finally:
+            # Restore original Popen
+            subprocess.Popen = original_popen
+            pdf2image_module.subprocess.Popen = original_popen
         
         if images:
             from io import BytesIO
