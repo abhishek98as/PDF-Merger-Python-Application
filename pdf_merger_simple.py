@@ -3,12 +3,27 @@ import sys
 import pathlib
 import tempfile
 import logging
+import threading
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer, QEvent
-from PyQt6.QtGui import QIcon, QPixmap, QAction, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import (
+    Qt, 
+    QSize, 
+    QThread, 
+    pyqtSignal, 
+    QTimer, 
+    QEvent
+)
+from PyQt6.QtGui import (
+    QIcon, 
+    QPixmap, 
+    QAction, 
+    QDragEnterEvent, 
+    QDropEvent, 
+    QKeySequence
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -28,6 +43,9 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QMenu,
     QScrollArea,
+    QCheckBox,
+    QSpinBox,
+    QGroupBox,
 )
 
 # External libraries
@@ -37,7 +55,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                   handlers=[
+                       logging.FileHandler("pdfmerger.log"),
+                       logging.StreamHandler()
+                   ])
 logger = logging.getLogger('PDFMerger')
 
 # Define path for resources
@@ -49,10 +71,29 @@ def get_resource_path():
 
 # Get the Poppler path
 def get_poppler_path():
+    """Find poppler binaries path with multiple fallback options."""
     base_path = pathlib.Path(__file__).resolve().parent
-    local_poppler = base_path / "poppler-23.11.0" / "Library" / "bin"
-    if local_poppler.exists():
-        return str(local_poppler)
+    
+    # If running as executable, check for bundled poppler
+    if hasattr(sys, '_MEIPASS'):
+        bundled_poppler = pathlib.Path(sys._MEIPASS) / "poppler" / "bin"
+        if bundled_poppler.exists():
+            logger.info(f"Using bundled poppler at: {bundled_poppler}")
+            return str(bundled_poppler)
+    
+    # Check for local poppler installations in order of preference
+    local_poppler_paths = [
+        base_path / "poppler-25.07.0" / "Library" / "bin",
+        base_path / "poppler-24.08.0" / "Library" / "bin", 
+        base_path / "poppler-23.11.0" / "Library" / "bin",
+        base_path / "poppler" / "Library" / "bin",
+        base_path / "poppler" / "bin",
+    ]
+    
+    for poppler_path in local_poppler_paths:
+        if poppler_path.exists() and (poppler_path / "pdftoppm.exe").exists():
+            logger.info(f"Found local poppler at: {poppler_path}")
+            return str(poppler_path)
     
     # Try environment variable
     env_path = os.environ.get("POPPLER_PATH")
@@ -62,24 +103,74 @@ def get_poppler_path():
     # On Windows, try common installation locations
     if sys.platform.startswith('win'):
         common_paths = [
+            r"C:\Release-25.07.0-0\Library\bin",
+            r"C:\Program Files\poppler-25.07.0\Library\bin",
+            r"C:\Program Files\poppler-24.08.0\Library\bin",
             r"C:\Program Files\poppler-23.11.0\Library\bin",
+            r"C:\Program Files\poppler\Library\bin",
             r"C:\Program Files\poppler\bin",
             r"C:\poppler\bin",
             os.path.expanduser("~\\poppler\\bin")
         ]
         for path in common_paths:
-            if os.path.exists(path):
+            if os.path.exists(path) and os.path.exists(os.path.join(path, "pdftoppm.exe")):
+                logger.info(f"Found system poppler at: {path}")
                 return path
-                
+    
+    logger.warning("Poppler not found in any standard locations")
     return None
 
 ASSETS_DIR = get_resource_path()
 ICON_PATH = ASSETS_DIR / "app_icon.png"
 POPPLER_PATH = get_poppler_path()
 
-# Global thread pool
-MAX_WORKERS = min(16, (os.cpu_count() or 1) + 4)
-THUMBNAIL_POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="thumbnail")
+def validate_poppler():
+    """Validate that poppler is available and working."""
+    if not POPPLER_PATH:
+        return False, "Poppler not found in any standard locations"
+    
+    # Check if pdftoppm.exe exists
+    pdftoppm_path = pathlib.Path(POPPLER_PATH) / "pdftoppm.exe"
+    if not pdftoppm_path.exists():
+        return False, f"pdftoppm.exe not found in {POPPLER_PATH}"
+    
+    try:
+        # Try to run pdftoppm to verify it works
+        import subprocess
+        
+        # Use CREATE_NO_WINDOW flag on Windows to prevent console window
+        creation_flags = 0
+        if sys.platform.startswith('win'):
+            creation_flags = 0x08000000  # CREATE_NO_WINDOW
+            
+        result = subprocess.run(
+            [str(pdftoppm_path), "-h"], 
+            capture_output=True, 
+            text=True, 
+            timeout=3,  # Reduced timeout
+            creationflags=creation_flags if sys.platform.startswith('win') else 0
+        )
+        
+        if result.returncode != 0 and "help" not in result.stderr.lower():
+            return False, f"pdftoppm failed to run: {result.stderr}"
+        return True, "Poppler is working correctly"
+    except subprocess.TimeoutExpired:
+        return False, "Poppler validation timed out"
+    except Exception as e:
+        return False, f"Error validating poppler: {str(e)}"
+
+# Validate poppler on startup
+POPPLER_AVAILABLE, POPPLER_STATUS = validate_poppler()
+if POPPLER_AVAILABLE:
+    logger.info(f"Poppler validation: {POPPLER_STATUS}")
+else:
+    logger.warning(f"Poppler validation failed: {POPPLER_STATUS}")
+
+# Global configuration - REDUCED for better performance
+MAX_WORKERS = min(2, (os.cpu_count() or 1))  # Reduce for stability - use fewer workers
+ACTIVE_WORKERS_LIMIT = 1  # Strictly limit to 1 concurrent processing
+THUMBNAIL_CACHE_SIZE = 30  # Smaller cache size to reduce memory usage
+THUMBNAIL_DPI = 72  # Lower DPI for faster thumbnail generation
 
 @dataclass
 class PDFEntry:
@@ -87,6 +178,147 @@ class PDFEntry:
     pages: int = 0
     thumb: Optional[QIcon] = None
     file_size: int = 0
+
+class WorkerManager:
+    """Thread-safe worker management for PDF processing."""
+    
+    def __init__(self):
+        self.thumbnail_workers = {}  # path -> worker
+        self.page_workers = {}  # path -> worker
+        self.thumbnail_cache = {}  # path -> QIcon (LRU cache)
+        self._lock = threading.Lock()
+        self._thumbnail_semaphore = threading.Semaphore(ACTIVE_WORKERS_LIMIT)
+        self._page_semaphore = threading.Semaphore(ACTIVE_WORKERS_LIMIT)
+        self._active_thumbnails = 0
+        self._active_page_counts = 0
+        self._batch_queue = []  # Queue of paths waiting to be processed
+        self._batch_processing = False
+        
+    def is_processing_thumbnail(self, path: pathlib.Path) -> bool:
+        """Check if thumbnail is being processed for this path."""
+        with self._lock:
+            return path in self.thumbnail_workers
+            
+    def is_processing_pages(self, path: pathlib.Path) -> bool:
+        """Check if page count is being processed for this path."""
+        with self._lock:
+            return path in self.page_workers
+    
+    def has_capacity(self) -> bool:
+        """Check if we have capacity to process more files."""
+        with self._lock:
+            return (self._active_thumbnails + self._active_page_counts) < ACTIVE_WORKERS_LIMIT
+            
+    def get_cached_thumbnail(self, path: pathlib.Path) -> Optional[QIcon]:
+        """Get cached thumbnail if available."""
+        with self._lock:
+            return self.thumbnail_cache.get(path)
+            
+    def cache_thumbnail(self, path: pathlib.Path, icon: QIcon) -> None:
+        """Cache thumbnail with LRU eviction."""
+        with self._lock:
+            # Simple LRU: remove oldest if at capacity
+            if len(self.thumbnail_cache) >= THUMBNAIL_CACHE_SIZE:
+                oldest_key = next(iter(self.thumbnail_cache))
+                del self.thumbnail_cache[oldest_key]
+            self.thumbnail_cache[path] = icon
+            
+    def start_thumbnail_worker(self, path: pathlib.Path, worker: 'SimpleThumbnailWorker') -> bool:
+        """Start thumbnail worker if not already processing and we have capacity."""
+        acquired = self._thumbnail_semaphore.acquire(blocking=False)
+        if not acquired:
+            logger.debug(f"No capacity for thumbnail worker, will try later: {path}")
+            return False
+            
+        with self._lock:
+            if path in self.thumbnail_workers:
+                self._thumbnail_semaphore.release()  # Release the permit
+                return False
+                
+            self.thumbnail_workers[path] = worker
+            self._active_thumbnails += 1
+            logger.debug(f"Started thumbnail worker for {path}, active: {self._active_thumbnails}")
+            return True
+            
+    def start_page_worker(self, path: pathlib.Path, worker: 'SimplePageCountWorker') -> bool:
+        """Start page count worker if not already processing and we have capacity."""
+        acquired = self._page_semaphore.acquire(blocking=False)
+        if not acquired:
+            logger.debug(f"No capacity for page worker, will try later: {path}")
+            return False
+            
+        with self._lock:
+            if path in self.page_workers:
+                self._page_semaphore.release()  # Release the permit
+                return False
+                
+            self.page_workers[path] = worker
+            self._active_page_counts += 1
+            logger.debug(f"Started page worker for {path}, active: {self._active_page_counts}")
+            return True
+            
+    def finish_thumbnail_worker(self, path: pathlib.Path) -> None:
+        """Remove finished thumbnail worker and release semaphore permit."""
+        with self._lock:
+            if path in self.thumbnail_workers:
+                self.thumbnail_workers.pop(path)
+                self._active_thumbnails -= 1
+                logger.debug(f"Finished thumbnail worker for {path}, active: {self._active_thumbnails}")
+                
+        # Release outside the lock to avoid deadlock
+        self._thumbnail_semaphore.release()
+            
+    def finish_page_worker(self, path: pathlib.Path) -> None:
+        """Remove finished page worker and release semaphore permit."""
+        with self._lock:
+            if path in self.page_workers:
+                self.page_workers.pop(path)
+                self._active_page_counts -= 1
+                logger.debug(f"Finished page worker for {path}, active: {self._active_page_counts}")
+                
+        # Release outside the lock to avoid deadlock
+        self._page_semaphore.release()
+            
+    def cleanup_all(self) -> None:
+        """Clean up all workers and cache."""
+        with self._lock:
+            # Wait for all workers to finish
+            for worker in list(self.thumbnail_workers.values()):
+                if worker.isRunning():
+                    try:
+                        worker.wait(500)  # Wait up to 0.5 second
+                    except:
+                        pass
+                    
+            for worker in list(self.page_workers.values()):
+                if worker.isRunning():
+                    try:
+                        worker.wait(500)
+                    except:
+                        pass
+                    
+            # Reset semaphores
+            for _ in range(self._active_thumbnails):
+                try:
+                    self._thumbnail_semaphore.release()
+                except:
+                    pass
+                    
+            for _ in range(self._active_page_counts):
+                try:
+                    self._page_semaphore.release()
+                except:
+                    pass
+                    
+            self._active_thumbnails = 0
+            self._active_page_counts = 0
+            self.thumbnail_workers.clear()
+            self.page_workers.clear()
+            self.thumbnail_cache.clear()
+            self._batch_queue.clear()
+
+# Global worker manager
+WORKER_MANAGER = WorkerManager()
 
 # Icon generation
 def generate_icon(path: pathlib.Path, size: int = 256) -> None:
@@ -120,23 +352,36 @@ def generate_icon(path: pathlib.Path, size: int = 256) -> None:
 
     img.save(path)
 
-# Background workers
+# Optimized background workers
 class SimpleThumbnailWorker(QThread):
     result = pyqtSignal(object, object)  # (pathlib.Path, QIcon)
     error = pyqtSignal(object, str)
+    finished_processing = pyqtSignal(object)  # (pathlib.Path)
 
     def __init__(self, path: pathlib.Path, thumb_size: Tuple[int, int] = (140, 180)):
         super().__init__()
         self.path = path
         self.thumb_size = thumb_size
+        self.finished.connect(lambda: self.finished_processing.emit(self.path))
 
     def run(self) -> None:
         try:
+            # Check cache first
+            cached_icon = WORKER_MANAGER.get_cached_thumbnail(self.path)
+            if cached_icon:
+                self.result.emit(self.path, cached_icon)
+                return
+                
+            # Fast path for small thumbnails - use first page with low DPI
             qpix = render_page_qpix(self.path, page_index=0, 
                                    max_w=self.thumb_size[0], 
-                                   max_h=self.thumb_size[1])
+                                   max_h=self.thumb_size[1],
+                                   dpi=THUMBNAIL_DPI)  # Use lower DPI
+                                   
             if not qpix.isNull():
-                self.result.emit(self.path, QIcon(qpix))
+                icon = QIcon(qpix)
+                WORKER_MANAGER.cache_thumbnail(self.path, icon)
+                self.result.emit(self.path, icon)
             else:
                 self.error.emit(self.path, "Failed to generate thumbnail")
         except Exception as e:
@@ -145,24 +390,34 @@ class SimpleThumbnailWorker(QThread):
 
 class SimplePageCountWorker(QThread):
     counted = pyqtSignal(object, int, int)  # (pathlib.Path, pages, file_size)
+    finished_processing = pyqtSignal(object)  # (pathlib.Path)
 
     def __init__(self, path: pathlib.Path):
         super().__init__()
         self.path = path
+        self.finished.connect(lambda: self.finished_processing.emit(self.path))
 
     def run(self) -> None:
         try:
-            # Get file stats
+            # Get file stats first (faster)
             stat = self.path.stat()
             file_size = stat.st_size
             
-            # Count pages using pypdf
-            reader = PdfReader(str(self.path))
-            page_count = len(reader.pages)
-            
-            self.counted.emit(self.path, page_count, file_size)
+            # Count pages using pypdf with error handling and timeout protection
+            try:
+                # Use a faster page counting method that doesn't fully load the document
+                reader = PdfReader(str(self.path))
+                page_count = len(reader.pages)
+                
+                self.counted.emit(self.path, page_count, file_size)
+            except Exception as e:
+                logger.error(f"PDF page counting error: {str(e)}")
+                self.counted.emit(self.path, 0, file_size)  # Still emit the file size
+                
         except Exception as e:
             logger.error(f"Page counting failed for {self.path}: {str(e)}")
+            # Emit default values on error
+            self.counted.emit(self.path, 0, 0)
 
 class MergeWorker(QThread):
     progress = pyqtSignal(int)
@@ -181,11 +436,16 @@ class MergeWorker(QThread):
             logger.info(f"Starting merge of {total} PDFs to {self.output_path}")
             
             for i, p in enumerate(self.paths, start=1):
-                reader = PdfReader(str(p))
-                for page in reader.pages:
-                    writer.add_page(page)
-                self.progress.emit(int(i / max(1, total) * 100))
-                logger.info(f"Added PDF {i}/{total}: {p}")
+                try:
+                    reader = PdfReader(str(p))
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    self.progress.emit(int(i / max(1, total) * 100))
+                    logger.info(f"Added PDF {i}/{total}: {p}")
+                except Exception as e:
+                    logger.error(f"Error adding PDF {p}: {str(e)}")
+                    self.failed.emit(f"Error processing {p.name}: {str(e)}")
+                    return
                 
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.output_path, "wb") as f:
@@ -257,9 +517,11 @@ class SimpleGridListWidget(QListWidget):
 
     def eventFilter(self, obj, event):
         if obj is self.viewport() and event.type() == QEvent.Type.DragEnter:
-            return self._dragEnterEvent(event)
+            self._dragEnterEvent(event)
+            return True
         if obj is self.viewport() and event.type() == QEvent.Type.Drop:
-            return self._dropEvent(event)
+            self._dropEvent(event)
+            return True
         return super().eventFilter(obj, event)
 
     def _dragEnterEvent(self, event: QDragEnterEvent):
@@ -267,16 +529,12 @@ class SimpleGridListWidget(QListWidget):
             urls = event.mimeData().urls()
             if any(str(u.toLocalFile()).lower().endswith(".pdf") for u in urls):
                 event.acceptProposedAction()
-                return True
-        return False
 
     def _dropEvent(self, event: QDropEvent):
         paths = [pathlib.Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile() and str(u.toLocalFile()).lower().endswith(".pdf")]
         if paths:
             self.filesDropped.emit(paths)
             event.acceptProposedAction()
-            return True
-        return False
 
 class SimpleScrollablePreview(QScrollArea):
     def __init__(self, parent=None):
@@ -290,12 +548,14 @@ class SimpleScrollablePreview(QScrollArea):
         self.layout.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.layout.setSpacing(15)
         self.setWidget(self.container)
+        self.current_path = None  # Track current path to avoid reloading
 
     def clear_pages(self):
         while self.layout.count():
             item = self.layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.current_path = None
 
     def show_message(self, text):
         self.clear_pages()
@@ -305,32 +565,67 @@ class SimpleScrollablePreview(QScrollArea):
         label.setStyleSheet("color: #9aa0a6; font-size: 14px; padding: 20px;")
         self.layout.addWidget(label)
 
-    def load_pdf(self, path, max_width=800):
+    def load_pdf(self, path, max_width=600):
+        # Skip reloading if already showing this PDF
+        if self.current_path == path:
+            return
+            
         self.clear_pages()
+        self.current_path = path
+        
+        if not POPPLER_AVAILABLE:
+            self.show_message(f"PDF Preview Not Available\n\n{POPPLER_STATUS}\n\nFile: {path.name}")
+            return
+            
         self.show_message("Loading PDF...")
         
+        # Use a timer to allow the UI to update before loading
+        QTimer.singleShot(100, lambda: self._load_pdf_delayed(path, max_width))
+    
+    def _load_pdf_delayed(self, path, max_width):
         try:
-            # Load first few pages for preview
+            # Check page count first
+            reader = PdfReader(str(path))
+            total_pages = len(reader.pages)
+            
+            # Limit preview pages for performance
+            max_preview_pages = min(2, total_pages)  # Reduced to 2 pages max
+            
+            # Load first few pages for preview with optimized DPI
             images = convert_from_path(
                 str(path), 
                 first_page=1, 
-                last_page=min(5, len(PdfReader(str(path)).pages)), 
-                dpi=150,
-                poppler_path=POPPLER_PATH
+                last_page=max_preview_pages, 
+                dpi=100,  # Reduced DPI for better performance
+                poppler_path=POPPLER_PATH,
+                thread_count=1,  # Use just 1 thread to avoid creating multiple processes
+                use_pdftocairo=True  # Try to use pdftocairo which is faster
             )
+            
+            # Clear old message
+            self.clear_pages()
+            self.current_path = path
             
             if images:
                 for i, img in enumerate(images):
-                    # Convert PIL image to QPixmap
+                    # Optimize image before converting to QPixmap
+                    # Resize if too large
+                    if img.width > max_width:
+                        ratio = max_width / img.width
+                        new_size = (int(img.width * ratio), int(img.height * ratio))
+                        img = img.resize(new_size, Image.LANCZOS)
+                    
+                    # Convert PIL image to QPixmap more efficiently
                     from io import BytesIO
                     buf = BytesIO()
-                    img.save(buf, format="PNG")
-                    qpix = QPixmap()
-                    qpix.loadFromData(buf.getvalue(), "PNG")
+                    # Use JPEG for better compression on preview
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    img.save(buf, format="JPEG", quality=80, optimize=True)
                     
-                    # Scale if needed
-                    if max_width and qpix.width() > max_width:
-                        qpix = qpix.scaledToWidth(max_width, Qt.TransformationMode.SmoothTransformation)
+                    qpix = QPixmap()
+                    qpix.loadFromData(buf.getvalue(), "JPEG")
+                    buf.close()  # Explicitly close buffer
                     
                     # Create page widget
                     page_label = QLabel()
@@ -351,16 +646,28 @@ class SimpleScrollablePreview(QScrollArea):
                     # Container
                     container = QWidget()
                     container_layout = QVBoxLayout(container)
+                    container_layout.setContentsMargins(5, 5, 5, 5)
                     container_layout.addWidget(page_label)
                     container_layout.addWidget(page_number)
                     
                     self.layout.addWidget(container)
+                
+                # Add info about total pages if more than preview
+                if total_pages > max_preview_pages:
+                    info_label = QLabel(f"Showing {max_preview_pages} of {total_pages} pages")
+                    info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    info_label.setStyleSheet("color: #9aa0a6; font-style: italic; padding: 10px;")
+                    self.layout.addWidget(info_label)
             else:
                 self.show_message("No pages could be loaded from this PDF")
                 
         except Exception as e:
             logger.error(f"Error loading PDF preview: {str(e)}")
-            self.show_message(f"Error loading PDF: {str(e)}")
+            error_msg = str(e)
+            if "poppler" in error_msg.lower():
+                self.show_message(f"PDF Preview Error\n\nPoppler is required for PDF preview but is not available.\n\nError: {error_msg}")
+            else:
+                self.show_message(f"Error loading PDF: {error_msg}")
 
 # Main Window
 class SimpleMainWindow(QMainWindow):
@@ -373,16 +680,25 @@ class SimpleMainWindow(QMainWindow):
         self.app_icon = QIcon(str(ICON_PATH))
         self.setWindowIcon(self.app_icon)
         
-        self._thumb_worker: Optional[SimpleThumbnailWorker] = None
-        self._page_worker: Optional[SimplePageCountWorker] = None
         self._pending_files: List[pathlib.Path] = []
         self._batch_timer = QTimer()
         self._batch_timer.timeout.connect(self._process_pending_files)
         self._batch_timer.setSingleShot(True)
+        self._active_workers = set()  # Track active workers for cleanup
+        self._merge_thread = None
 
         self._init_ui()
+        self._setup_shortcuts()
         self._apply_styles()
         self._update_count()
+        
+        # Check poppler status and warn user if needed
+        if not POPPLER_AVAILABLE:
+            QTimer.singleShot(1000, self._show_poppler_warning)
+            self.statusBar().showMessage("Warning: PDF thumbnails and preview not available", 8000)
+        else:
+            # Show welcome message
+            self.statusBar().showMessage("Ready - Drag & drop PDF files or use Add PDFs button", 5000)
 
     def _init_ui(self):
         tb = QToolBar("Main")
@@ -461,6 +777,62 @@ class SimpleMainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar())
 
+    def _setup_shortcuts(self):
+        """Setup keyboard shortcuts for common actions."""
+        # Add files shortcut
+        add_shortcut = QAction("Add Files", self)
+        add_shortcut.setShortcut(QKeySequence("Ctrl+O"))
+        add_shortcut.triggered.connect(self.on_add)
+        self.addAction(add_shortcut)
+        
+        # Remove selected shortcut
+        remove_shortcut = QAction("Remove Selected", self)
+        remove_shortcut.setShortcut(QKeySequence("Delete"))
+        remove_shortcut.triggered.connect(self.on_remove)
+        self.addAction(remove_shortcut)
+        
+        # Clear all shortcut
+        clear_shortcut = QAction("Clear All", self)
+        clear_shortcut.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        clear_shortcut.triggered.connect(self.on_reset)
+        self.addAction(clear_shortcut)
+        
+        # Merge shortcut
+        merge_shortcut = QAction("Merge", self)
+        merge_shortcut.setShortcut(QKeySequence("Ctrl+M"))
+        merge_shortcut.triggered.connect(self.on_merge)
+        self.addAction(merge_shortcut)
+        
+        # Select all shortcut
+        select_all_shortcut = QAction("Select All", self)
+        select_all_shortcut.setShortcut(QKeySequence("Ctrl+A"))
+        select_all_shortcut.triggered.connect(self.listw.selectAll)
+        self.addAction(select_all_shortcut)
+        
+        # Update button tooltips with shortcuts
+        self.btn_add.setToolTip("Add PDF files (Ctrl+O)")
+        self.btn_remove.setToolTip("Remove selected files (Delete)")
+        self.btn_reset.setToolTip("Clear all files (Ctrl+Shift+N)")
+        self.btn_merge.setToolTip("Merge PDFs (Ctrl+M)")
+        self.btn_add_folder.setToolTip("Add all PDFs from a folder")
+
+    def _show_poppler_warning(self):
+        """Show warning dialog when poppler is not available."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("PDF Preview Not Available")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText("PDF thumbnails and preview are not available")
+        msg.setInformativeText(
+            f"Poppler utilities are required for PDF thumbnails and preview.\n\n"
+            f"Status: {POPPLER_STATUS}\n\n"
+            f"PDF merging will still work, but you won't see thumbnails or previews.\n\n"
+            f"To fix this issue:\n"
+            f"• Ensure poppler binaries are in the application folder\n"
+            f"• Or install poppler and add it to your system PATH"
+        )
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
     def _apply_styles(self):
         self.setStyleSheet(
             """
@@ -530,8 +902,19 @@ class SimpleMainWindow(QMainWindow):
         self.add_paths([pathlib.Path(p) for p in paths])
 
     def add_paths(self, paths: List[pathlib.Path]):
+        """Add PDF files to the list with proper throttling."""
         if not paths:
             return
+            
+        # Limit the number of paths to process at once to avoid overloading
+        MAX_PATHS_AT_ONCE = 10  # Reduced from 20
+        if len(paths) > MAX_PATHS_AT_ONCE:
+            logger.info(f"Too many files ({len(paths)}), limiting initial batch to {MAX_PATHS_AT_ONCE}")
+            # Process in batches
+            remaining = paths[MAX_PATHS_AT_ONCE:]
+            paths = paths[:MAX_PATHS_AT_ONCE]
+            # Schedule the rest for later processing
+            QTimer.singleShot(2000, lambda: self.add_paths(remaining))  # Increased delay to 2000ms
             
         existing = {self.listw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.listw.count())}
         
@@ -546,6 +929,8 @@ class SimpleMainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, p)
             item.setToolTip(str(p))
             item.setText(f"{p.name}\nAnalyzing...")
+            # Use a generic icon first while the thumbnail is loading
+            item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
             item.setSizeHint(self.listw.gridSize())
             self.listw.addItem(item)
             new_paths.append(p)
@@ -553,35 +938,70 @@ class SimpleMainWindow(QMainWindow):
         if new_paths:
             self._pending_files.extend(new_paths)
             self._batch_timer.stop()
-            self._batch_timer.start(500)
+            self._batch_timer.start(500)  # Increased from 200ms to 500ms
             
             logger.info(f"Added {len(new_paths)} files to pending batch")
             self.statusBar().showMessage(f"Added {len(new_paths)} file(s) - Processing...", 4000)
 
     def _process_pending_files(self):
+        """Process pending files with better batch handling and throttling."""
         if not self._pending_files:
             return
             
-        files_to_process = self._pending_files.copy()
-        self._pending_files.clear()
+        # Check if we have capacity
+        capacity = WORKER_MANAGER.has_capacity()
+        if not capacity:
+            logger.debug("No capacity for processing more files, retrying in 1000ms")
+            # Re-schedule the timer to try again later
+            self._batch_timer.stop()
+            self._batch_timer.start(1000)  # Increased to 1000ms
+            return
+            
+        # Get just one file to process at a time
+        files_to_process = self._pending_files[:1]
         
-        logger.info(f"Processing batch of {len(files_to_process)} files")
+        # Remove file we're going to process from the pending list
+        self._pending_files = self._pending_files[1:]
         
-        # Process each file individually to avoid complex threading
+        logger.info(f"Processing single file (remaining: {len(self._pending_files)})")
+        
+        # Process each file individually with throttling
         for path in files_to_process:
             self._process_single_file(path)
+            
+        # If we have more pending files, schedule another run
+        if self._pending_files:
+            self._batch_timer.stop()
+            self._batch_timer.start(800)  # Increased from 200ms to 800ms
 
     def _process_single_file(self, path: pathlib.Path):
-        # Start thumbnail generation
-        self._thumb_worker = SimpleThumbnailWorker(path, self.listw.iconSize())
-        self._thumb_worker.result.connect(self._on_thumb_ready)
-        self._thumb_worker.error.connect(self._on_thumb_error)
-        self._thumb_worker.start()
+        # Start thumbnail generation if not already processing
+        if not WORKER_MANAGER.is_processing_thumbnail(path):
+            # Check cache first
+            cached_icon = WORKER_MANAGER.get_cached_thumbnail(path)
+            if cached_icon:
+                self._on_thumb_ready(path, cached_icon)
+            else:
+                thumb_worker = SimpleThumbnailWorker(path, (self.listw.iconSize().width(), self.listw.iconSize().height()))
+                thumb_worker.result.connect(self._on_thumb_ready)
+                thumb_worker.error.connect(self._on_thumb_error)
+                thumb_worker.finished_processing.connect(WORKER_MANAGER.finish_thumbnail_worker)
+                thumb_worker.finished_processing.connect(lambda p: self._active_workers.discard(thumb_worker))
+                
+                if WORKER_MANAGER.start_thumbnail_worker(path, thumb_worker):
+                    self._active_workers.add(thumb_worker)
+                    thumb_worker.start()
         
-        # Start page counting
-        self._page_worker = SimplePageCountWorker(path)
-        self._page_worker.counted.connect(self._on_pages_ready)
-        self._page_worker.start()
+        # Start page counting if not already processing
+        if not WORKER_MANAGER.is_processing_pages(path):
+            page_worker = SimplePageCountWorker(path)
+            page_worker.counted.connect(self._on_pages_ready)
+            page_worker.finished_processing.connect(WORKER_MANAGER.finish_page_worker)
+            page_worker.finished_processing.connect(lambda p: self._active_workers.discard(page_worker))
+            
+            if WORKER_MANAGER.start_page_worker(path, page_worker):
+                self._active_workers.add(page_worker)
+                page_worker.start()
 
     def on_add_folder(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select a folder containing PDFs", str(pathlib.Path.home()))
@@ -633,12 +1053,52 @@ class SimpleMainWindow(QMainWindow):
         if self.listw.count() == 0:
             QMessageBox.information(self, "Nothing to merge", "Add some PDF files first.")
             return
+            
+        # Check if any files are still being processed
+        active_processing = len([f for f in self._pending_files]) > 0
+        if active_processing:
+            reply = QMessageBox.question(
+                self, 
+                "Processing in Progress", 
+                "Some files are still being processed. Do you want to wait and try again?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.statusBar().showMessage("Please wait for file processing to complete...", 3000)
+                return
+                
         out_dir = QFileDialog.getExistingDirectory(self, "Choose output directory", str(pathlib.Path.home()))
         if not out_dir:
             return
+            
+        # Check if output file already exists
         out_path = pathlib.Path(out_dir) / "merged.pdf"
+        if out_path.exists():
+            reply = QMessageBox.question(
+                self, 
+                "File Exists", 
+                f"File '{out_path.name}' already exists. Overwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+                
         paths = [self.listw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.listw.count())]
+        
+        # Validate all files exist
+        missing_files = [p for p in paths if not p.exists()]
+        if missing_files:
+            QMessageBox.warning(
+                self, 
+                "Missing Files", 
+                f"Some files no longer exist:\n{chr(10).join(str(f) for f in missing_files[:3])}"
+                + (f"\n... and {len(missing_files) - 3} more" if len(missing_files) > 3 else "")
+            )
+            return
+            
         self.progress.setValue(0)
+        self.statusBar().showMessage(f"Starting merge of {len(paths)} PDF files...")
+        
         self._merge_thread = MergeWorker(paths, out_path)
         self._merge_thread.progress.connect(self.progress.setValue)
         self._merge_thread.finished_ok.connect(self._on_merge_done)
@@ -668,13 +1128,66 @@ class SimpleMainWindow(QMainWindow):
     def _on_merge_done(self, out_path: str):
         self._toggle_controls(True)
         self.progress.setValue(100)
-        self.statusBar().showMessage(f"Merged to {out_path}", 8000)
-        QMessageBox.information(self, "Done", f"Merged PDF saved to:\n{out_path}")
+        
+        # Check output file size
+        try:
+            output_file = pathlib.Path(out_path)
+            file_size = output_file.stat().st_size
+            size_mb = file_size / (1024 * 1024)
+            if size_mb > 1024:
+                size_str = f"{size_mb/1024:.1f} GB"
+            else:
+                size_str = f"{size_mb:.1f} MB"
+                
+            self.statusBar().showMessage(f"Successfully merged to {output_file.name} ({size_str})", 10000)
+            
+            # Show success dialog with options
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Merge Complete")
+            msg.setText(f"Successfully merged {self.listw.count()} PDF files!")
+            msg.setInformativeText(f"Output: {output_file.name}\nSize: {size_str}\nLocation: {output_file.parent}")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+            
+            # Add button to open folder
+            open_folder_btn = msg.addButton("Open Folder", QMessageBox.ButtonRole.ActionRole)
+            
+            result = msg.exec()
+            if msg.clickedButton() == open_folder_btn:
+                # Open folder containing the merged file
+                import subprocess
+                # Use CREATE_NO_WINDOW flag on Windows to prevent console window
+                creation_flags = 0
+                if sys.platform.startswith('win'):
+                    creation_flags = 0x08000000  # CREATE_NO_WINDOW
+                    subprocess.run(['explorer', '/select,', str(output_file)], 
+                                   creationflags=creation_flags)
+                elif sys.platform.startswith('darwin'):
+                    subprocess.run(['open', '-R', str(output_file)])
+                else:
+                    subprocess.run(['xdg-open', str(output_file.parent)])
+                    
+        except Exception as e:
+            logger.error(f"Error checking output file: {e}")
+            self.statusBar().showMessage(f"Merge completed: {out_path}", 8000)
+            QMessageBox.information(self, "Merge Complete", f"Merged PDF saved to:\n{out_path}")
 
     def _on_merge_failed(self, err: str):
         self._toggle_controls(True)
-        self.statusBar().showMessage("Merge failed", 6000)
-        QMessageBox.critical(self, "Merge failed", err)
+        self.progress.setValue(0)
+        self.statusBar().showMessage("Merge failed - check logs for details", 8000)
+        
+        # Better error message
+        if "permission" in err.lower():
+            error_msg = "Permission denied. The output file might be open in another application or you don't have write permissions."
+        elif "memory" in err.lower() or "ram" in err.lower():
+            error_msg = "Not enough memory to process these PDF files. Try merging fewer files at once."
+        elif "corrupt" in err.lower() or "invalid" in err.lower():
+            error_msg = "One or more PDF files appear to be corrupted or invalid."
+        else:
+            error_msg = f"Merge operation failed:\n{err}"
+            
+        QMessageBox.critical(self, "Merge Failed", error_msg)
 
     def _toggle_controls(self, enabled: bool):
         self.listw.setEnabled(enabled)
@@ -700,7 +1213,8 @@ class SimpleMainWindow(QMainWindow):
         path: pathlib.Path = item.data(Qt.ItemDataRole.UserRole)
         pages = item.data(Qt.ItemDataRole.UserRole + 1) or 0
         
-        self.preview_scroll.load_pdf(path)
+        # Use a delay before loading the preview to prevent UI freeze
+        QTimer.singleShot(200, lambda: self.preview_scroll.load_pdf(path))
         
         file_size = item.data(Qt.ItemDataRole.UserRole + 2) or 0
         size_mb = file_size / (1024 * 1024) if file_size > 0 else 0
@@ -710,17 +1224,24 @@ class SimpleMainWindow(QMainWindow):
     def closeEvent(self, event):
         logger.info("Application closing, cleaning up resources...")
         
-        if self._thumb_worker and self._thumb_worker.isRunning():
-            self._thumb_worker.wait(3000)
-            
-        if self._page_worker and self._page_worker.isRunning():
-            self._page_worker.wait(3000)
+        # Stop batch timer
+        self._batch_timer.stop()
         
+        # Clean up active workers
+        logger.info(f"Waiting for {len(self._active_workers)} active workers to finish...")
+        for worker in list(self._active_workers):
+            if worker.isRunning():
+                try:
+                    worker.terminate()  # Forcefully terminate workers to avoid hang
+                except:
+                    pass
+        
+        # Clean up worker manager
         try:
-            THUMBNAIL_POOL.shutdown(wait=False)
-            logger.info("Thread pool shutdown initiated")
+            WORKER_MANAGER.cleanup_all()
+            logger.info("Worker manager cleanup completed")
         except Exception as e:
-            logger.warning(f"Error during thread pool shutdown: {e}")
+            logger.error(f"Error during worker manager cleanup: {e}")
         
         event.accept()
 
@@ -735,48 +1256,115 @@ def ensure_icon():
     except Exception as e:
         logger.error(f"Icon generation failed: {str(e)}", exc_info=True)
 
-def render_page_qpix(path: pathlib.Path, page_index: int = 0, max_w: Optional[int] = None, max_h: Optional[int] = None) -> QPixmap:
-    try:
-        images = convert_from_path(
-            str(path), 
-            first_page=page_index + 1, 
-            last_page=page_index + 1, 
-            dpi=150,
-            poppler_path=POPPLER_PATH
-        )
+def render_page_qpix(path: pathlib.Path, page_index: int = 0, max_w: Optional[int] = None, max_h: Optional[int] = None, dpi: int = 72) -> QPixmap:
+    if not POPPLER_AVAILABLE:
+        logger.error(f"Cannot render PDF page - {POPPLER_STATUS}")
+        return QPixmap()
         
-        if images:
-            from io import BytesIO
-            img = images[0]
-            if max_w or max_h:
-                img.thumbnail((max_w or img.width, max_h or img.height), Image.LANCZOS)
-            buf = BytesIO()
-            img.save(buf, format="PNG", optimize=True)
-            qpix = QPixmap()
-            qpix.loadFromData(buf.getvalue(), "PNG")
-            return qpix
-        else:
-            logger.error(f"pdf2image returned no images for {path}")
+    try:
+        # Create a temporary directory that will be cleaned up automatically
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            import subprocess
             
+            # Use pdftoppm directly for better performance and control
+            if sys.platform.startswith('win'):
+                pdftoppm_path = os.path.join(POPPLER_PATH, 'pdftoppm.exe')
+                creation_flags = 0x08000000  # CREATE_NO_WINDOW
+            else:
+                pdftoppm_path = os.path.join(POPPLER_PATH, 'pdftoppm')
+                creation_flags = 0
+                
+            output_prefix = os.path.join(tmp_dir, "thumb")
+            
+            # Run pdftoppm subprocess directly (faster than pdf2image for thumbnails)
+            cmd = [
+                pdftoppm_path,
+                "-jpeg",       # Output as JPEG
+                "-singlefile", # Only one output file
+                "-r", str(dpi), # Lower DPI for thumbnails
+                "-f", str(page_index + 1),  # First page
+                "-l", str(page_index + 1),  # Last page
+                str(path),
+                output_prefix
+            ]
+            
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creation_flags if sys.platform.startswith('win') else 0
+            )
+            
+            # Check if file was created
+            output_file = f"{output_prefix}.jpg"
+            if os.path.exists(output_file):
+                qpix = QPixmap(output_file)
+                
+                # Scale if needed
+                if max_w and qpix.width() > max_w:
+                    qpix = qpix.scaledToWidth(max_w, Qt.TransformationMode.SmoothTransformation)
+                
+                return qpix
+            else:
+                # Fall back to pdf2image if direct approach fails
+                logger.debug(f"pdftoppm direct approach failed, falling back to pdf2image")
+                images = convert_from_path(
+                    str(path),
+                    first_page=page_index + 1,
+                    last_page=page_index + 1,
+                    dpi=dpi,
+                    poppler_path=POPPLER_PATH,
+                    thread_count=1,  # Use single thread to avoid multiple processes
+                    use_pdftocairo=True,  # Try to use pdftocairo which is faster
+                    output_folder=tmp_dir
+                )
+                
+                if images:
+                    # Convert PIL image to QPixmap
+                    img = images[0]
+                    from io import BytesIO
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=80, optimize=True)
+                    qpix = QPixmap()
+                    qpix.loadFromData(buf.getvalue())
+                    buf.close()
+                    
+                    # Scale if needed
+                    if max_w and qpix.width() > max_w:
+                        qpix = qpix.scaledToWidth(max_w, Qt.TransformationMode.SmoothTransformation)
+                        
+                    return qpix
+    
     except Exception as e:
-        logger.error(f"PDF rendering failed: {str(e)}", exc_info=True)
-
+        logger.error(f"PDF rendering failed for {path}: {str(e)}", exc_info=True)
+        
+    # Return empty pixmap on failure
     return QPixmap()
 
 def cleanup_resources():
     logger.info("Performing final cleanup...")
     try:
-        THUMBNAIL_POOL.shutdown(wait=True)
-        logger.info("Thread pool shutdown completed")
+        WORKER_MANAGER.cleanup_all()
+        logger.info("Worker manager cleanup completed")
     except Exception as e:
         logger.error(f"Error during final cleanup: {e}")
 
 def main():
+    # When freezing with PyInstaller, prevent showing console window
+    if sys.platform.startswith('win') and hasattr(sys, 'frozen'):
+        import win32gui
+        import win32con
+        # Hide console window
+        hwnd = win32gui.GetForegroundWindow()
+        if hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+    
     # Enable high DPI on Windows
-    if hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):
-        QApplication.setHighDpiScaleFactorRoundingPolicy(
-            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-        )
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
     
     app = QApplication(sys.argv)
     app.setApplicationName("PDF Merger App - Simple")
